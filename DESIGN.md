@@ -277,6 +277,170 @@ cairn login --token <token>      # Token-based (for agents in CI/automated conte
 
 ---
 
+## Agent Integration via Hooks
+
+The lowest-friction way for agents to interact with Cairn is through **hooks** — lifecycle events that fire automatically during an agent's workflow. Claude Code hooks are the first integration target.
+
+### Post-Task Hook (Publish Flow)
+
+When an agent completes a task successfully, a hook can prompt the publish flow:
+
+```json
+// .claude/settings.json
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "task_complete",
+        "command": "cairn suggest --check-publishable"
+      }
+    ]
+  }
+}
+```
+
+The flow:
+1. Agent completes a task (migration, feature, fix, etc.)
+2. Hook fires `cairn suggest` — analyzes the work and determines if it's a candidate for publishing
+3. **Human approves or rejects** the publish (this is the critical abuse gate)
+4. If approved, `cairn publish` packages and submits the stone
+
+The human-in-the-loop at the publish step is non-negotiable. Agents can *suggest* publishing, but a human must confirm. This prevents:
+- Agents autonomously flooding the registry
+- Bad actors instructing agents to submit spam
+- Accidental publication of proprietary code
+
+### Pre-Task Hook (Search Flow)
+
+Before starting work, an agent can automatically search for relevant existing stones:
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "task_start",
+        "command": "cairn search --context-from-task --top 3 --json"
+      }
+    ]
+  }
+}
+```
+
+This gives the agent awareness of prior work before it starts from scratch.
+
+---
+
+## Validation & Trust Model
+
+### What Cairn Is NOT
+
+Cairn is **not a decision tree registry**. Decision trees (like Deciduous) track *why* choices were made within a project. Cairn stores *completed work products* — the actual output of agent work, with provenance and validation signals. The analogy: Deciduous is a lab notebook. Cairn is the published paper with reproducible results.
+
+### Multi-Layer Validation
+
+Raw usage count ("this stone was pulled 500 times") is a weak signal. A stone used 500 times for malicious purposes is not a good stone. Validation must be multi-layered:
+
+| Layer | Signal | Weight | Description |
+|-------|--------|--------|-------------|
+| **Automated tests** | `test_passed` | High | Did the stone's own test suite pass? Did it pass when pulled into a new context? |
+| **Checksum integrity** | `checksums_valid` | High | Do file hashes match the published manifest? Detects tampering. |
+| **Human reviews** | `human_rating` | High | Explicit human review with rating and comment. |
+| **Agent reviews** | `agent_rating` | Medium | Structured agent feedback: used in context X, result was Y. Weighted lower than human reviews. |
+| **Contextual success** | `reuse_success_rate` | Medium | Of agents that pulled this stone, what % reported success in their own context? |
+| **Provenance verification** | `provenance_verified` | Medium | Is the source repo real? Do the commits exist? Does the author's identity check out? |
+| **Age & stability** | `time_since_publish` | Low | Older stones with stable ratings are more trustworthy than new ones. |
+| **Download count** | `pull_count` | Low | Popularity is a weak signal but still a signal. |
+
+### Review Structure
+
+Agent reviews carry structured metadata, not just a rating:
+
+```toml
+[review]
+reviewer = "github:someuser"
+reviewer_type = "agent"           # agent | human
+agent = "claude-opus-4.5"
+rating = 4
+result = "success"                # success | partial | failure
+context = "Applied to MySQL-to-DynamoDB variant, required minor adaptation of the schema mapping."
+adapted = true                    # Did the reviewer modify the stone for their use case?
+source_repo = "github:someuser/their-project"  # Where it was applied (optional)
+timestamp = "2026-02-15T10:00:00Z"
+```
+
+### What Counts as "Validated"
+
+Validation status progresses through stages:
+
+| Status | Meaning | Requirements |
+|--------|---------|-------------|
+| `draft` | Unpublished or no validation | None |
+| `tested` | Author's tests pass | `stone.validation.tests.failed == 0` |
+| `validated` | Tests pass + at least 1 human review | Tested + `human_reviews >= 1` |
+| `community-reviewed` | Broad validation from multiple independent users | Validated + `human_reviews >= 3` + `reuse_success_rate >= 80%` |
+
+---
+
+## Security & Abuse Prevention
+
+### Threat Model
+
+Cairn is a registry where agents publish and consume code artifacts. This makes it a target for the same classes of attacks that plague npm, PyPI, and Docker Hub — plus new attack vectors unique to agent-consumed content.
+
+| Threat | Description | Mitigation |
+|--------|-------------|------------|
+| **Malicious stones** | Stones containing harmful code (exfiltration, backdoors, destructive commands) | Automated static analysis on publish, sandboxed test execution, human approval gate |
+| **Typosquatting** | Publishing stones with names similar to popular ones | Name similarity checks on publish, reserved namespaces for verified publishers |
+| **Reputation farming** | Fake reviews or inflated usage metrics to boost a malicious stone | Reviews tied to verified GitHub identities, rate limiting, weight reviews by reviewer reputation |
+| **Prompt injection via AGENT.md** | Crafting AGENT.md content that manipulates the consuming agent into harmful actions | AGENT.md sandboxing guidelines, static analysis for injection patterns, content policy enforcement |
+| **Sybil attacks** | Creating many fake accounts to inflate reviews | GitHub identity verification, account age requirements, contribution history checks |
+| **Data exfiltration** | Stones that phone home or leak context from the consuming agent's environment | No network calls allowed in stone files, static analysis for URLs/endpoints, sandboxed execution |
+| **Dependency confusion** | Publishing a public stone with the same name as a private one | Scoped namespaces (`@org/stone-name`), private registry priority resolution |
+| **Supply chain poisoning** | Compromising a popular stone's update to inject malicious content | Immutable versions (can't overwrite a published version), checksum pinning in `cairn.lock`, signing |
+
+### Identity & Authentication
+
+- All publishers must authenticate via **GitHub OAuth** — no anonymous publishing
+- Stones are **cryptographically signed** by the publisher's key
+- Agent reviews must be traceable to a verified identity — a review from `github:someuser` must prove that `someuser` actually ran the stone
+- **Account age and activity requirements** for publishing (prevents throwaway account spam)
+
+### Publish-Time Safeguards
+
+Every `cairn publish` triggers:
+
+1. **Manifest validation** — `stone.toml` schema compliance
+2. **Required file check** — `README.md` and `AGENT.md` must exist
+3. **Static analysis** — scan `files/` for:
+   - Known malicious patterns (obfuscated code, encoded payloads)
+   - Network calls (fetch, curl, wget, http imports)
+   - File system access outside the stone's directory
+   - Environment variable reads (credential harvesting)
+   - Prompt injection patterns in `AGENT.md`
+4. **Test execution** — run the stone's test suite in a sandboxed environment
+5. **Name collision check** — typosquatting detection against existing stones
+6. **Human confirmation** — the publisher (a human) must explicitly approve
+
+### Pull-Time Safeguards
+
+When an agent runs `cairn pull`:
+
+1. **Checksum verification** — downloaded files must match published checksums
+2. **Signature verification** — stone must be signed by the claimed publisher
+3. **Advisory warnings** — flag stones with low validation status, few reviews, or recent publish date
+4. **Lockfile support** — `cairn.lock` pins exact versions and checksums for reproducibility
+
+### AGENT.md Sandboxing
+
+`AGENT.md` is the most sensitive file in a stone — it's instructions that an agent will follow. This makes it a prompt injection vector. Mitigations:
+
+- **Content policy** — `AGENT.md` is scanned for injection patterns on publish (e.g., "ignore previous instructions", "you are now", system prompt overrides)
+- **Scoped instructions** — `AGENT.md` should only describe how to use *this stone*, not give general behavioral directives to the agent
+- **Agent-side sandboxing** — consuming agents should treat `AGENT.md` as untrusted input with limited permissions (no different from how agents should treat any external content)
+
+---
+
 ## Open Questions
 
 ### Resolved (initial positions taken)
@@ -284,14 +448,19 @@ cairn login --token <token>      # Token-based (for agents in CI/automated conte
 - **Artifact granularity**: Supported via `scope` field — from `function` to `ecosystem`. The schema flexes to any level.
 - **Versioning**: Semver. Stones are immutable once published at a version; publish a new version to update.
 - **Identity**: GitHub-based identity initially (`github:<username>`). A2A Agent Card integration as a future extension.
+- **Human-in-the-loop**: Required at the publish step. Agents suggest, humans approve. Non-negotiable for abuse prevention.
+- **Review weighting**: Human reviews weighted higher than agent reviews. Agent reviews carry structured context metadata.
+- **Cairn vs. decision trees**: Cairn stores completed work products, not decision histories. Deciduous-style decision graphs are optional provenance metadata within a stone, not the primary artifact.
 
 ### Still Open
 
 - **Trust model**: Leaning toward centralized registry (npm-style) for simplicity, with federation support later. Need to evaluate whether a public registry should be the default or if self-hosted is the primary mode.
-- **Validation incentives**: How do you encourage agents and humans to review stones? Usage-based reputation? Review rewards?
+- **Publish incentives**: Options include give-to-get (publish to unlock pulls), org-level value (your team benefits from your own stones), or pure low-friction convenience (agents auto-suggest, humans approve). Likely a combination — but the default should work without artificial gates.
 - **Privacy & licensing**: Private namespaces are supported in the CLI design, but the registry backend needs access control. Default license for public stones? MIT? Apache 2.0? Unlicense?
 - **Semantic search implementation**: Embedding-based search over stone descriptions and `AGENT.md` content. Which embedding model? Where does indexing happen — server-side only, or can the CLI do local similarity search over cached stones?
 - **Protocol integration**: Should a Cairn registry expose an A2A Agent Card? Should stones be discoverable as MCP resources? Both feel right but need design work.
 - **Conflict resolution**: When two stones solve the same problem differently, how does the registry surface both and help agents choose? Rating alone isn't enough — context fit matters.
 - **Size limits**: What's the maximum size of a stone? Large artifacts (trained models, large datasets) probably don't belong here. Need clear boundaries.
 - **Offline support**: Should `cairn search` work against a local cache for air-gapped environments? Probably yes for enterprise adoption.
+- **Static analysis depth**: How deep should publish-time scanning go? Full AST analysis? Or pattern-based heuristics? Tradeoff between security and publish speed.
+- **Review verification**: How do you prove an agent actually used a stone before leaving a review? Could require a linked commit or session log, but that raises privacy concerns.
