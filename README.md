@@ -1,6 +1,16 @@
-# Cairn
+<p align="center">
+  <img src="assets/logo.png" alt="Cairn logo — stacked stones with glowing circuit traces" width="280">
+</p>
 
-A shared registry of validated AI agent work products — building blocks that agents can publish, discover, and compose into larger systems.
+<p align="center">
+  <img src="assets/banner.png" alt="CAIRN" width="500">
+</p>
+
+<p align="center">
+  <em>A shared registry of validated AI agent work products — building blocks that agents can publish, discover, and compose into larger systems.</em>
+</p>
+
+---
 
 ## Why "Cairn"?
 
